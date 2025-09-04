@@ -12,7 +12,7 @@ from utils_time import jakarta_bounds_yesterday_utc, yday_label_str
 from topics import fetch_all_topics, iter_topic_messages_yesterday, resolve_username
 from members import fetch_member_count
 from reports import build_yesterday_report_parquet
-from db import get_engine, ensure_tables_exist, load_parquet_to_mysql
+from db import *
 
 # ====== CONFIG ======
 load_dotenv()
@@ -101,7 +101,7 @@ async def dump_yesterday_messages_and_member():
                 df_messages=df,
                 out_dir=OUT_DIR,
                 now_utc=now_utc,
-                all_topics=topics,  # <--- kasih semua topics biar totalnya bener
+                all_topics=topics,  # give all topics so totals are correct
             )
             print(f"[✓] Saved daily report: {report_path}")
 
@@ -127,14 +127,8 @@ async def dump_yesterday_messages_and_member():
         print(f"[✓] Saved member count: {members_path} | members: {members_count}")
 
 
-# === NEW: async loader MySQL terpisah ===
+# === async loader MySQL ===
 async def load_yesterday_parquets_into_mysql():
-    """
-    Muat 3 parquet 'kemarin' ke MySQL:
-      - telegram_messages_yday (messages)
-      - telegram_member_count_daily (member_count)
-      - telegram_yday_report (report)
-    """
     now_utc = datetime.now(timezone.utc)
     yday_str = yday_label_str(now_utc)
 
@@ -142,7 +136,6 @@ async def load_yesterday_parquets_into_mysql():
     member_parquet = OUT_DIR / f"yesterday_member_count_{yday_str}.parquet"
     report_parquet = OUT_DIR / f"yesterday_report_{yday_str}.parquet"
 
-    # pastikan file ada
     paths = {
         "telegram_messages_yday": (
             messages_parquet if messages_parquet.exists() else None
@@ -153,71 +146,76 @@ async def load_yesterday_parquets_into_mysql():
         "telegram_yday_report": report_parquet if report_parquet.exists() else None,
     }
 
-    engine = get_engine(
-        mysql_host=MYSQL_HOST,
-        mysql_user=MYSQL_USER,
-        mysql_password=MYSQL_PASSWORD,
-        mysql_database=MYSQL_DATABASE,
-        mysql_port=MYSQL_PORT,
-    )
+    def _sync_load():
+        results = {}
+        conn = None
+        try:
+            conn = get_conn(
+                mysql_host=MYSQL_HOST,
+                mysql_user=MYSQL_USER,
+                mysql_password=MYSQL_PASSWORD,
+                mysql_database=MYSQL_DATABASE,
+                mysql_port=MYSQL_PORT,
+            )
+            ensure_tables_exist(conn)
 
-    # bikin table jika belum ada (jalan di thread agar non-blocking)
-    await asyncio.to_thread(ensure_tables_exist, engine)
+            if paths["telegram_messages_yday"]:
+                inserted = load_parquet_to_mysql(
+                    conn,
+                    str(paths["telegram_messages_yday"]),
+                    "telegram_messages_yday",
+                    True,
+                    "date_label_jkt",
+                )
+                results["telegram_messages_yday"] = inserted
+                print(f"[✓] MySQL inserted {inserted} rows -> telegram_messages_yday")
+            else:
+                print("[i] Skip messages: parquet not found")
 
-    results = {}
-    # 1) messages: tambahkan date_label_jkt dari nama file (karena tidak ada di parquet messages)
-    if paths["telegram_messages_yday"]:
-        inserted = await asyncio.to_thread(
-            load_parquet_to_mysql,
-            engine,
-            str(paths["telegram_messages_yday"]),
-            "telegram_messages_yday",
-            True,  # add_date_label_if_missing
-            "date_label_jkt",
-        )
-        results["telegram_messages_yday"] = inserted
-        print(f"[✓] MySQL inserted {inserted} rows -> telegram_messages_yday")
-    else:
-        print("[i] Skip messages: parquet not found")
+            if paths["telegram_member_count_daily"]:
+                inserted = load_parquet_to_mysql(
+                    conn,
+                    str(paths["telegram_member_count_daily"]),
+                    "telegram_member_count_daily",
+                    False,
+                    "date_label_jkt",
+                )
+                results["telegram_member_count_daily"] = inserted
+                print(
+                    f"[✓] MySQL inserted {inserted} rows -> telegram_member_count_daily"
+                )
+            else:
+                print("[i] Skip member_count: parquet not found")
 
-    # 2) member_count: sudah ada date_label_jkt di parquet
-    if paths["telegram_member_count_daily"]:
-        inserted = await asyncio.to_thread(
-            load_parquet_to_mysql,
-            engine,
-            str(paths["telegram_member_count_daily"]),
-            "telegram_member_count_daily",
-            False,
-            "date_label_jkt",
-        )
-        results["telegram_member_count_daily"] = inserted
-        print(f"[✓] MySQL inserted {inserted} rows -> telegram_member_count_daily")
-    else:
-        print("[i] Skip member_count: parquet not found")
+            if paths["telegram_yday_report"]:
+                inserted = load_parquet_to_mysql(
+                    conn,
+                    str(paths["telegram_yday_report"]),
+                    "telegram_yday_report",
+                    False,
+                    "date_label_jkt",
+                )
+                results["telegram_yday_report"] = inserted
+                print(f"[✓] MySQL inserted {inserted} rows -> telegram_yday_report")
+            else:
+                print("[i] Skip report: parquet not found")
 
-    # 3) report: sudah ada date_label_jkt di parquet
-    if paths["telegram_yday_report"]:
-        inserted = await asyncio.to_thread(
-            load_parquet_to_mysql,
-            engine,
-            str(paths["telegram_yday_report"]),
-            "telegram_yday_report",
-            False,
-            "date_label_jkt",
-        )
-        results["telegram_yday_report"] = inserted
-        print(f"[✓] MySQL inserted {inserted} rows -> telegram_yday_report")
-    else:
-        print("[i] Skip report: parquet not found")
+            return results
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
 
-    return results
+    return await asyncio.to_thread(_sync_load)
 
 
 def main():
     async def _run():
-        # 1) dump & generate semua parquet kemarin
+        # 1) dump yesterday messages + member count ke parquet
         await dump_yesterday_messages_and_member()
-        # 2) load parquet kemarin ke MySQL (kalau file-nya ada)
+        # 2) load parquet to MySQL
         results = await load_yesterday_parquets_into_mysql()
         print(f"[✓] MySQL load results: {results}")
 

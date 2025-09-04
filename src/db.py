@@ -2,27 +2,44 @@
 from __future__ import annotations
 import os
 import re
-from typing import Optional
+from typing import Optional, Iterable, List, Tuple
 import pandas as pd
-from sqlalchemy import create_engine, text
+import mysql.connector
+from mysql.connector import Error
 
 
-def get_engine(mysql_host, mysql_user, mysql_password, mysql_database, mysql_port):
+# -------- Connection --------
+def get_conn(
+    mysql_host: str,
+    mysql_user: str,
+    mysql_password: str,
+    mysql_database: str,
+    mysql_port: int = 3306,
+):
     """
-    Buat SQLAlchemy engine untuk MySQL (driver pymysql), charset utf8mb4.
-    Pastikan 'pymysql' terinstall: pip install pymysql sqlalchemy
+    Create a mysql-connector connection (utf8mb4).
+    Requires: pip install mysql-connector-python
     """
-    uri = (
-        f"mysql+pymysql://{mysql_user}:{mysql_password}"
-        f"{mysql_host}:{mysql_port}/{mysql_database}?charset=utf8mb4"
+    conn = mysql.connector.connect(
+        host=mysql_host,
+        user=mysql_user,
+        password=mysql_password,
+        database=mysql_database,
+        port=int(mysql_port),
+        charset="utf8mb4",
+        use_unicode=True,
+        autocommit=True,
     )
-    engine = create_engine(uri, pool_pre_ping=True, pool_recycle=3600)
-    return engine
+    return conn
 
 
-def ensure_tables_exist(engine):
+get_engine = get_conn
+
+
+# -------- Schema / Tables --------
+def ensure_tables_exist(conn):
     """
-    Buat tabel kalau belum ada, sesuai schema 'plain' (tanpa index/PK).
+    Create tables if not exists using mysql-connector (no SQLAlchemy).
     """
     ddl_messages = """
     CREATE TABLE IF NOT EXISTS telegram_messages_yday (
@@ -62,16 +79,16 @@ def ensure_tables_exist(engine):
     );
     """
 
-    with engine.begin() as conn:
-        conn.execute(text(ddl_messages))
-        conn.execute(text(ddl_member_count))
-        conn.execute(text(ddl_report))
+    with conn.cursor() as cur:
+        cur.execute(ddl_messages)
+        cur.execute(ddl_member_count)
+        cur.execute(ddl_report)
 
 
+# -------- Helpers --------
 def _extract_yyyymmdd_from_filename(path_str: str) -> Optional[str]:
     """
-    Ambil 8 digit tanggal dari nama file (YYYYMMDD).
-    Return 'YYYY-MM-DD' atau None.
+    Get 8-digit date from filename (YYYYMMDD) → 'YYYY-MM-DD' or None.
     """
     m = re.search(r"(\d{8})", os.path.basename(path_str))
     if not m:
@@ -80,18 +97,41 @@ def _extract_yyyymmdd_from_filename(path_str: str) -> Optional[str]:
     return f"{y}-{mo}-{d}"
 
 
+def _chunk_rows(rows: List[Tuple], size: int) -> Iterable[List[Tuple]]:
+    for i in range(0, len(rows), size):
+        yield rows[i : i + size]
+
+
+def _build_insert_sql(table_name: str, columns: list[str]) -> str:
+    cols = ", ".join(f"`{c}`" for c in columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    return f"INSERT INTO `{table_name}` ({cols}) VALUES ({placeholders})"
+
+
+def _normalize_datetimes(df: pd.DataFrame, cols: list[str]) -> None:
+    for col in cols:
+        if col in df.columns:
+            s = pd.to_datetime(df[col], errors="coerce")
+            try:
+                if getattr(s.dt, "tz", None) is not None:
+                    s = s.dt.tz_convert(None)
+            except Exception:
+                try:
+                    s = s.dt.tz_localize(None)
+                except Exception:
+                    pass
+            df[col] = s
+
+
+# -------- Load Parquet → MySQL (mysql-connector) --------
 def load_parquet_to_mysql(
-    engine,
+    conn,
     parquet_path: str,
     table_name: str,
     add_date_label_if_missing: bool = False,
     date_label_col: str = "date_label_jkt",
+    batch_size: int = 1000,
 ):
-    """
-    Load satu Parquet ke table MySQL (append).
-    - add_date_label_if_missing: kalau True dan kolom date_label_jkt belum ada,
-      kita isi dari nama file (ambil YYYYMMDD -> YYYY-MM-DD).
-    """
     df = pd.read_parquet(parquet_path)
 
     if add_date_label_if_missing and date_label_col not in df.columns:
@@ -99,8 +139,6 @@ def load_parquet_to_mysql(
         if dt_str:
             df[date_label_col] = dt_str
 
-    # Normalisasi kolom agar cocok dengan schema (kolom yang tidak ada akan ditambahkan sebagai NaN)
-    # Mapping requirement per table:
     if table_name == "telegram_messages_yday":
         expected_cols = [
             "date_label_jkt",
@@ -113,6 +151,7 @@ def load_parquet_to_mysql(
             "text",
             "reply_to_msg_id",
         ]
+        _normalize_datetimes(df, ["date_utc"])
     elif table_name == "telegram_member_count_daily":
         expected_cols = [
             "date_label_jkt",
@@ -121,6 +160,7 @@ def load_parquet_to_mysql(
             "members_count",
             "taken_at_utc",
         ]
+        _normalize_datetimes(df, ["taken_at_utc"])
     elif table_name == "telegram_yday_report":
         expected_cols = [
             "date_label_jkt",
@@ -140,18 +180,18 @@ def load_parquet_to_mysql(
         if col not in df.columns:
             df[col] = pd.NA
 
-    # Reorder ke expected_cols (biar aman)
     df = df[expected_cols]
 
-    # Tipe waktu: biar aman, biarkan pandas kirim sebagai datetime (SQLAlchemy akan handle)
-    # Insert batch
-    df.to_sql(
-        name=table_name,
-        con=engine,
-        if_exists="append",
-        index=False,
-        method="multi",
-        chunksize=1000,
-    )
+    df = df.where(pd.notnull(df), None)
 
-    return len(df)
+    sql = _build_insert_sql(table_name, expected_cols)
+
+    rows: List[Tuple] = list(map(tuple, df.itertuples(index=False, name=None)))
+
+    total = 0
+    with conn.cursor() as cur:
+        for chunk in _chunk_rows(rows, batch_size):
+            cur.executemany(sql, chunk)
+            total += len(chunk)
+
+    return total
